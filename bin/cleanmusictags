@@ -1,0 +1,21 @@
+#!/usr/bin/env perl
+#
+#   Usage: cleanmusictags -h
+#
+#   Martin Senger <martin.senger@gmail.com>
+#   April 2012
+#
+# ABSTRACT: Check and clean music tags in the music files
+# PODNAME: App::cleanmusictags
+# -----------------------------------------------------------------
+use warnings;
+use strict;
+
+# VERSION
+
+use FindBin qw($Bin);
+use lib "$Bin/../lib";
+use lib 'lib';
+
+use App::cleanmusictags;
+App::cleanmusictags->run();

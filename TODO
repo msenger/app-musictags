@@ -1,0 +1,55 @@
+* All songs in an album have the same album name.
+
+* If more artists:
+  a) We may change it to one, or
+  b) We need to set the TCMP to 1.
+
+* Can be more artist tags for the same song?
+
+* Normalize of the artist's name?
+
+* Tracks:
+  - missing?
+  - 2-digits long?
+
+* What to do with AlbumArtist?
+  - set it from artists?
+  - remove it completely?
+
+* What is in comments? Remove them?
+
+* Invalid ID3v2 tag - what to do with them?
+
+* Wide characters in print
+
+  Perhaps: binmode STDOUT, ":utf8"; - but only for STDOUT, for
+  updating MP3 files I think to use just the binmode?
+
+* et al.
+  - means: et alii
+           [Latin: and others]
+
+* currently: the albums with just 1 piece are ignored
+
+* the tag names may be different for wma
+  (see http://help.mp3tag.de/main_tags.html)
+
+Command-line arguments
+----------------------
+
+-dir <starting-directory> ... default: none (usually /c/My Music)
+-output <file> ... default: stdout
+-errors <file> ... default: stderr
+-input <file>  ... the same format as was previously an output file
+               ... it also indicate that modifications are going to be done
+-verbose ... prints also albums that do not require any change
+
+-list
+    MISSALB => 'Missing album name',
+    AMBIALB => 'Ambiguous album names',
+    MOREART => 'More artists within the album',
+    NONEART => 'No artist, at all',
+    ALBARTM => 'Missing album artist',
+    SETCOLL => 'Set all pieces as parts of a collection',
+    MISSTRK => 'Missing all track numbers',
+    SOMETRK => 'Some track numbers are missing or duplicated',
