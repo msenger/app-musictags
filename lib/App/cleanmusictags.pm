@@ -17,6 +17,7 @@ use parent 'App::Cmdline';
 use File::Find ();
 use File::Spec;
 use Audio::Scan;
+use Music::Tag (traditional => 1);
 use Data::Dumper;
 
 my $actions = {
@@ -31,10 +32,12 @@ my $actions = {
     # DELCOMM => 'Remove comments',   #TBD
 };
 
-my $ignore;     # what issues to ignore (keys are action codes)
-my $report;     # where to report
-my $input;      # what to change (file with a previoulsy created report)
-my $verbose;    # TBD: not only if but also how much verbose?
+my $musicdir;    # where is my music
+my $ignore;      # what issues to ignore (keys are action codes)
+my $report;      # where to report
+my $input;       # what to change (file with a previoulsy created report)
+my $verbose;     # TBD: not only if but also how much verbose?
+my $donotchange; # do not change any music file
 
 #-----------------------------------------------------------------
 # Command-line arguments and script usage.
@@ -48,7 +51,8 @@ sub opt_spec {
 	[ 'list'          => 'show available "issue-codes" and exit'                  ],
 	[ 'only=s@{0,}'   => '<issue-code>... report/change only the given issues'    ],
 	[ 'ignore=s@{0,}' => '<issue-code>... report/change all but the given issues' ],
-	[ 'verbose'       => 'print detailed commentsto the report (may be huge)'     ],
+	[ 'verbose'       => 'print detailed comments (to the report or to STDOUT)'   ],
+	[ 'donotchange'   => 'do not modify any files, just report potential changes' ],
 	[],
 	$self->composed_of (
 	    'App::Cmdline::Options::Basic',
@@ -74,6 +78,12 @@ sub validate_args {
 
     # verbose?
     $verbose = 1 if $opt->verbose;
+
+    # real modifications?
+    $donotchange = 1 if $opt->donotchange;
+
+    # add the full path to the starting directory 
+    $musicdir = File::Spec->rel2abs ($opt->music);
 
     # prepare the handlers for report OR input
     # (report and input are mutually exclusive)
@@ -121,20 +131,170 @@ sub wanted {
 sub execute {
     my ($self, $opt, $args) = @_;
 
-    # traverse and process desired directories
-    File::Find::find ({ wanted => \&wanted }, $opt->music);
+    if ($report) {
+	# traverse, process desired directories and report
+	File::Find::find ({ wanted => \&wanted }, $musicdir);
+
+    } else {
+	# modify files
+ 	my $wanted_changes = read_report();
+	foreach my $album (@$wanted_changes) {
+	    my $album_dir = $album->[0];
+	    if ($donotchange) {
+		# print info
+		print STDOUT $album_dir, "\n";
+		foreach my $code (keys %{ $album->[1] }) {
+		    verbose ("\t$code => " . $album->[1]->{$code} . "\n");
+		}
+
+	    } else {
+		# find every MP3 file in this album
+		opendir (my $dh, $album_dir)
+		    or die "Cannot read $album_dir: $!\n";
+		my @mp3files = grep { /\.mp3$/i && -f File::Spec->catfile ($album_dir, $_) } readdir ($dh);
+		closedir ($dh);
+
+		# modify each MP3 file
+		verbose ("Album: $album_dir\n");
+		my $file_count = 0;
+		foreach my $file (@mp3files) {
+		    $file_count++;
+		    my $full_filename = File::Spec->catfile ($album_dir, $file);
+		    my $changes = 0;
+		    my $taggable = Music::Tag->new ($full_filename, { quiet => 1 }, "Auto");
+		    $taggable->get_tag();
+		    foreach my $code (keys %{ $album->[1] }) {
+			next if exists $ignore->{$code};
+			my $value = $album->[1]->{$code};
+			$value =~ s{^\s*|\s*$}{}g;
+			next unless $value;
+			no strict;
+			if (&$code ($taggable, $value, $file_count)) {
+			    $changes++;
+			    verbose ("\t$code => $value [$file]\n");
+			}
+		    }
+		    if ($changes) {
+			$taggable->set_tag();
+			$taggable->close();
+		    }
+		}
+	    }
+	}
+    }
     exit (0);
 }
 
+sub MISSALB { # 'Missing album name',
+    my ($taggable, $value, $order) = @_;
+    return 0 if $taggable->album() eq $value;
+    $taggable->album ($value);
+    return 1;
+}
+sub AMBIALB { # 'Ambiguous album names',
+    my ($taggable, $value, $order) = @_;
+    return 0 if $taggable->album() eq $value;
+    $taggable->album ($value);
+    return 1;
+}
+sub MOREART { # 'More artists within the album',
+    my ($taggable, $value, $order) = @_;
+    return 0 if $taggable->artist() eq $value;
+    $taggable->artist ($value);
+    return 1;
+}
+sub NONEART { # 'No artist, at all',
+    my ($taggable, $value, $order) = @_;
+    return 0 if $taggable->artist() eq $value;
+    $taggable->artist ($value);
+    return 1;
+}
+sub ALBARTM { # 'Missing album artist',
+    my ($taggable, $value, $order) = @_;
+    return 0 if $taggable->artist() eq $value;
+    $taggable->albumartist ($value);
+    return 1;
+}
+sub SETCOLL { # 'Set all pieces as parts of a collection',
+    my ($taggable, $value, $order) = @_;
+    # return 0 if $taggable->compilation() eq $value;
+    # $taggable->compilation ($value);
+    # return 1;
+    return 0;
+}
+sub MISSTRK { # 'Missing all track numbers',
+    my ($taggable, $value, $order) = @_;
+    if (lc ($value) eq 'number all tracks') {
+	$taggable->track ($order);
+	return 1;
+    }
+    return 0;
+}
+sub SOMETRK { # 'Some track numbers are missing or duplicated',
+    my ($taggable, $value, $order) = @_;
+    if (lc ($value) eq 'number all tracks') {
+	return 0 if $taggable->track() == $order;
+	$taggable->track ($order);
+	return 1;
+    }
+    return 0;
+}
+
 #-----------------------------------------------------------------
-# The main job is done here.
+# Read the $input file into this structure (an example):
+# [
+#   [
+#     '/c/My Music/testdata/Hity 1964 vol.2',
+#     {
+#       'SETCOLL' => 'yes',
+#       'MOREART' => '',
+#       'ALBARTM' => 'Various artists',
+#       'AMBIALB' => 'Hity 1964'
+#     }
+#   ],
+#   [
+#     '/c/My Music/testdata/30 let Ceske Country/3',
+#     {
+#       'SETCOLL' => 'yes',
+#       'MOREART' => '',
+#       'ALBARTM' => 'Various artists'
+#     }
+#   ],
+# Return this structure.
+#-----------------------------------------------------------------
+sub read_report {
+    my $wanted_changes = [];
+    my $album = [undef, {}];
+    while (my $line = <$input>) {
+	chomp $line;
+	if ($line =~ m{^\s*ALBUM:\s*(.*)}i) {
+	    # e.g.: ALBUM: /c/My Music/Hity 1964 vol.2
+	    my $new_album = $1;
+	    push (@$wanted_changes, $album)  # finalize the previous album
+		if defined $album->[0];
+	    $album = [$new_album, {}];       # and start a new album
+
+	} elsif ($line =~ m{^\s*Change\s+to\s*\[([^\]]*)\]\s*\(([^\)]+)\)}i) {
+	    # e.g.: Change to [Various artists] (ALBARTM) Missing album artist
+	    my $change_to = $1;
+	    my $code = $2;
+	    $album->[1]->{$code} = $change_to;
+	}
+    }
+    # finalize the last album
+    push (@$wanted_changes, $album)
+	if defined $album->[0];
+    return $wanted_changes;
+}
+
+#-----------------------------------------------------------------
+# The main REPORTING job is done here.
 #-----------------------------------------------------------------
 sub process_dir {
     my $dirname = shift;
-
     opendir (my $dh, $dirname)
 	or die "Cannot read $dirname: $!\n";
-    my @mp3files = grep { /\.mp3$/ && -f File::Spec->catfile ($dirname, $_) } readdir ($dh);
+    my @mp3files = grep { /\.mp3$/i && -f File::Spec->catfile ($dirname, $_) } readdir ($dh);
     closedir ($dh);
     my $piece_count = scalar @mp3files;
 
@@ -338,6 +498,11 @@ sub comment {
 	if $verbose;
 }
 
+sub verbose {
+    my $msg = shift;
+    print STDOUT $msg
+	if $verbose;
+}
 
 1;
 __END__
