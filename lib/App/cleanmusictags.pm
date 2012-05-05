@@ -18,6 +18,7 @@ use File::Find ();
 use File::Spec;
 use Audio::Scan;
 use Music::Tag (traditional => 1);
+use MP3::Tag;
 use Data::Dumper;
 
 my $actions = {
@@ -25,7 +26,7 @@ my $actions = {
     AMBIALB => 'Ambiguous album names',
     MOREART => 'More artists within the album',
     NONEART => 'No artist, at all',
-    ALBARTM => 'Missing album artist',
+    ALBARTA => 'Ambiguous album artist',
     SETCOLL => 'Set all pieces as parts of a collection',
     MISSTRK => 'Missing all track numbers',
     SOMETRK => 'Some track numbers are missing or duplicated',
@@ -36,8 +37,7 @@ my $musicdir;    # where is my music
 my $ignore;      # what issues to ignore (keys are action codes)
 my $report;      # where to report
 my $input;       # what to change (file with a previoulsy created report)
-my $verbose;     # TBD: not only if but also how much verbose?
-my $donotchange; # do not change any music file
+my $options;     # command-line options
 
 #-----------------------------------------------------------------
 # Command-line arguments and script usage.
@@ -53,6 +53,7 @@ sub opt_spec {
 	[ 'ignore=s@{0,}' => '<issue-code>... report/change all but the given issues' ],
 	[ 'verbose'       => 'print detailed comments (to the report or to STDOUT)'   ],
 	[ 'donotchange'   => 'do not modify any files, just report potential changes' ],
+	[ 'repsuggest'    => 'report only changes that have some suggestions'         ],
 	[],
 	$self->composed_of (
 	    'App::Cmdline::Options::Basic',
@@ -69,18 +70,15 @@ sub validate_args {
 
     # show list and exit
     if ($opt->list) {
-	print STDOUT "CODE  \tISSUE\n";
+	verbose ("CODE  \tISSUE\n");
 	foreach my $key (sort keys %$actions) {
-	    print STDOUT "$key\t", $actions->{$key}, "\n";
+	    msg (join ('', "$key\t", $actions->{$key}, "\n"));
 	}
         exit (0);
     }
 
-    # verbose?
-    $verbose = 1 if $opt->verbose;
-
-    # real modifications?
-    $donotchange = 1 if $opt->donotchange;
+    # remember options in a global variable
+    $options = $opt;
 
     # add the full path to the starting directory 
     $musicdir = File::Spec->rel2abs ($opt->music);
@@ -131,6 +129,8 @@ sub wanted {
 sub execute {
     my ($self, $opt, $args) = @_;
 
+    local $| = 1;
+
     if ($report) {
 	# traverse, process desired directories and report
 	File::Find::find ({ wanted => \&wanted }, $musicdir);
@@ -140,44 +140,47 @@ sub execute {
  	my $wanted_changes = read_report();
 	foreach my $album (@$wanted_changes) {
 	    my $album_dir = $album->[0];
-	    if ($donotchange) {
+	    if ($options->donotchange) {
 		# print info
-		print STDOUT $album_dir, "\n";
+		msg ("$album_dir\n");
 		foreach my $code (keys %{ $album->[1] }) {
-		    verbose ("\t$code => " . $album->[1]->{$code} . "\n");
+		    my $value = $album->[1]->{$code};
+		    $value =~ s{^\s*|\s*$}{}g;
+		    if ($value) {
+			verbose ("\t$code => $value\n");
+		    }
 		}
 
 	    } else {
 		# find every MP3 file in this album
 		opendir (my $dh, $album_dir)
 		    or die "Cannot read $album_dir: $!\n";
-		my @mp3files = grep { /\.mp3$/i && -f File::Spec->catfile ($album_dir, $_) } readdir ($dh);
+		my @mp3files = sort grep { /\.mp3$/i && -f File::Spec->catfile ($album_dir, $_) } readdir ($dh);
 		closedir ($dh);
 
 		# modify each MP3 file
-		verbose ("Album: $album_dir\n");
+		msg ("Album: $album_dir"); verbose ("\n");
 		my $file_count = 0;
+		my $changes = 0;
 		foreach my $file (@mp3files) {
 		    $file_count++;
 		    my $full_filename = File::Spec->catfile ($album_dir, $file);
-		    my $changes = 0;
-		    my $taggable = Music::Tag->new ($full_filename, { quiet => 1 }, "Auto");
-		    $taggable->get_tag();
+		    my $code_options = { file       => $file,
+					 file_count => $file_count };
 		    foreach my $code (keys %{ $album->[1] }) {
 			next if exists $ignore->{$code};
 			my $value = $album->[1]->{$code};
 			$value =~ s{^\s*|\s*$}{}g;
 			next unless $value;
 			no strict;
-			if (&$code ($taggable, $value, $file_count)) {
+			if (&$code ($full_filename, $value, $code_options)) {
 			    $changes++;
 			    verbose ("\t$code => $value [$file]\n");
 			}
 		    }
-		    if ($changes) {
-			$taggable->set_tag();
-			$taggable->close();
-		    }
+		}
+		if (!$options->verbose or $changes == 0) {
+		    msg ("\t$changes changes made\n");
 		}
 	    }
 	}
@@ -186,58 +189,150 @@ sub execute {
 }
 
 sub MISSALB { # 'Missing album name',
-    my ($taggable, $value, $order) = @_;
-    return 0 if $taggable->album() eq $value;
-    $taggable->album ($value);
-    return 1;
+    return AMBIALB (@_);
 }
+
 sub AMBIALB { # 'Ambiguous album names',
-    my ($taggable, $value, $order) = @_;
-    return 0 if $taggable->album() eq $value;
+    my ($filename, $value) = @_;
+
+    # reading the current value using Audio::Scan because it does not
+    # trip the read value (as Music::tag does)
+    my $data = Audio::Scan->scan_tags ($filename);
+    my $tags = $data->{tags};
+    my $album = $tags->{TALB};
+    return 0 if is_eq ($album, $value);
+
+    my $taggable = get_taggable ($filename);
     $taggable->album ($value);
+    $taggable->set_tag();
+    $taggable->close();
     return 1;
 }
+
 sub MOREART { # 'More artists within the album',
-    my ($taggable, $value, $order) = @_;
-    return 0 if $taggable->artist() eq $value;
-    $taggable->artist ($value);
-    return 1;
+    my ($filename, $value) = @_;
+    # TBD: should use here also Audio::Scan for reading the current value (as in AMBIALB)
+    my $taggable = get_taggable ($filename);
+    if (is_eq ($taggable->artist(), $value)) {
+	$taggable->close();
+	return 0;
+    } else {
+	$taggable->artist ($value);
+	$taggable->set_tag();
+	$taggable->close();
+	return 1;
+    }
 }
+
 sub NONEART { # 'No artist, at all',
-    my ($taggable, $value, $order) = @_;
-    return 0 if $taggable->artist() eq $value;
-    $taggable->artist ($value);
-    return 1;
+    return MOREART (@_);
 }
-sub ALBARTM { # 'Missing album artist',
-    my ($taggable, $value, $order) = @_;
-    return 0 if $taggable->artist() eq $value;
-    $taggable->albumartist ($value);
-    return 1;
+
+sub ALBARTA { # 'Ambiguous album artist',
+    my ($filename, $value) = @_;
+
+    # reading the current value using Audio::Scan because it does not
+    # trip the read value (as Music::tag does)
+    my $data = Audio::Scan->scan_tags ($filename);
+    my $tags = $data->{tags};
+    my $album_artist = $tags->{TPE2};
+    return 0 if is_eq ($album_artist, $value);
+    return add_tag_directly ($filename, 'TPE2', $value);
 }
-sub SETCOLL { # 'Set all pieces as parts of a collection',
-    my ($taggable, $value, $order) = @_;
-    # return 0 if $taggable->compilation() eq $value;
-    # $taggable->compilation ($value);
-    # return 1;
-    return 0;
+
+sub SETCOLL { # 'Set all pieces as parts of a collection (compilation)',
+    my ($filename, $value) = @_;
+    return 0 unless lc($value) eq 'yes';
+    return add_tag_directly ($filename, "TCMP", "1");
 }
+
 sub MISSTRK { # 'Missing all track numbers',
-    my ($taggable, $value, $order) = @_;
-    if (lc ($value) eq 'number all tracks') {
-	$taggable->track ($order);
-	return 1;
-    }
-    return 0;
+    my ($filename, $value, $options) = @_;
+    return 0 unless lc ($value) eq 'number all tracks';
+    my $track = $options->{file_count};
+    my $taggable = get_taggable ($filename);
+
+    $taggable->track ($track);
+    $taggable->set_tag();
+    $taggable->close();
+    return 1;
+
+    # if (is_eq ($taggable->tracknum(), $track)) {
+    # 	$taggable->close();
+    # 	return 0;
+    # } else {
+    # 	$taggable->tracknum ($track);
+    # 	$taggable->set_tag();
+    # 	$taggable->close();
+    # 	return 1;
+    # }
 }
+
 sub SOMETRK { # 'Some track numbers are missing or duplicated',
-    my ($taggable, $value, $order) = @_;
-    if (lc ($value) eq 'number all tracks') {
-	return 0 if $taggable->track() == $order;
-	$taggable->track ($order);
-	return 1;
+    return MISSTRK (@_);
+}
+
+sub get_taggable {
+    my $taggable = Music::Tag->new (shift(), { quiet => 1 }, "Auto");
+    $taggable->get_tag();
+    return $taggable;
+}
+
+sub is_eq {
+    my ($old_value, $new_value) = @_;
+    return 0 unless defined $old_value;
+    $old_value eq $new_value;
+}
+
+# Max Baker
+# 4/29/09
+# sub add_compilation {
+#     my $file = shift;
+#     my $mp3 = MP3::Tag->new ($file);
+#     $mp3->config ('write_v24' => 1);
+ 
+#     # scan file for existing tags
+#     $mp3->get_tags;
+ 
+#     unless (exists $mp3->{ID3v2}) {
+#         $mp3->new_tag ("ID3v2");
+#     }
+ 
+#     # check for existing tag
+#     my ($info, $name, @rest) = $mp3->{ID3v2}->get_frame("TCMP");
+#     if (defined ($info)) {
+# 	return 0;
+#     }   
+ 
+#     $mp3->{ID3v2}->add_frame ("TCMP", "1")
+# 	or die "$file : Adding TCMP frame failed.\n";
+#     $mp3->{ID3v2}->write_tag;
+#     $mp3->close();
+#     return 1;
+# }
+
+sub add_tag_directly {
+    my ($file, $tag, $value) = @_;
+    my $mp3 = MP3::Tag->new ($file);
+    $mp3->config ('write_v24' => 1);
+ 
+    # scan file for existing tags
+    $mp3->get_tags;
+ 
+    unless (exists $mp3->{ID3v2}) {
+        $mp3->new_tag ("ID3v2");
     }
-    return 0;
+ 
+    # check for existing tag
+    my ($info, $name, @rest) = $mp3->{ID3v2}->get_frame ($tag);
+    if (defined ($info)) {
+	return 0;
+    }   
+    $mp3->{ID3v2}->add_frame ($tag, $value)
+	or die "$file : Adding $tag frame failed.\n";
+    $mp3->{ID3v2}->write_tag;
+    $mp3->close();
+    return 1;
 }
 
 #-----------------------------------------------------------------
@@ -248,7 +343,7 @@ sub SOMETRK { # 'Some track numbers are missing or duplicated',
 #     {
 #       'SETCOLL' => 'yes',
 #       'MOREART' => '',
-#       'ALBARTM' => 'Various artists',
+#       'ALBARTA' => 'Various artists',
 #       'AMBIALB' => 'Hity 1964'
 #     }
 #   ],
@@ -257,7 +352,7 @@ sub SOMETRK { # 'Some track numbers are missing or duplicated',
 #     {
 #       'SETCOLL' => 'yes',
 #       'MOREART' => '',
-#       'ALBARTM' => 'Various artists'
+#       'ALBARTA' => 'Various artists'
 #     }
 #   ],
 # Return this structure.
@@ -271,11 +366,11 @@ sub read_report {
 	    # e.g.: ALBUM: /c/My Music/Hity 1964 vol.2
 	    my $new_album = $1;
 	    push (@$wanted_changes, $album)  # finalize the previous album
-		if defined $album->[0];
+		if album_exists ($album->[0]);
 	    $album = [$new_album, {}];       # and start a new album
 
 	} elsif ($line =~ m{^\s*Change\s+to\s*\[([^\]]*)\]\s*\(([^\)]+)\)}i) {
-	    # e.g.: Change to [Various artists] (ALBARTM) Missing album artist
+	    # e.g.: Change to [Various artists] (ALBARTA) Missing album artist
 	    my $change_to = $1;
 	    my $code = $2;
 	    $album->[1]->{$code} = $change_to;
@@ -283,8 +378,14 @@ sub read_report {
     }
     # finalize the last album
     push (@$wanted_changes, $album)
-	if defined $album->[0];
+	if album_exists ($album->[0]);
     return $wanted_changes;
+}
+
+sub album_exists {
+    my $albumdir = shift;
+    return 0 unless defined $albumdir;
+    return -d $albumdir;
 }
 
 #-----------------------------------------------------------------
@@ -312,7 +413,8 @@ sub process_dir {
     my $artists = {};
     my $missing_artists_count = 0;
     my $tcmp_count = 0;
-    my $album_artist_exists = 0;
+    my $album_artist = {};
+    my $missing_album_artist_count = 0;
 
     my $tracks = {};
     my $comments = {};
@@ -343,7 +445,9 @@ sub process_dir {
 
 	    # check the album artist
 	    if (defined $tags->{TPE2}) {
-		$album_artist_exists = 1;
+		$album_artist->{ $tags->{TPE2} }++;
+	    } else {
+		$missing_album_artist_count++;
 	    }
 
 	    # check tracks numbers
@@ -405,27 +509,19 @@ sub process_dir {
     }
     if ($artists_count == 0) {
 	# no artist, at all
-	out (suggest ($hinfo, '', 'NONEART', $actions->{NONEART}));
+	out (suggest ($hinfo, 'Various artists', 'NONEART', $actions->{NONEART}));
     }
 
     # report about album artist
-    unless ($album_artist_exists) {
-	# suggest an album artist based on the artists frequencies
-	my $album_artist;
-	if ($artists_count > 1) {
-	    if ($suggested_artist and $suggested_artist !~ m{various}i) {
-		$album_artist = "$suggested_artist et al.";
-	    } elsif ($suggested_artist =~ m{various}i) {
-		$album_artist = $suggested_artist;
-	    } else {
-		$album_artist = 'Various artists';
-	    }
-	} elsif ($artists_count == 1) {
-	    $album_artist = (keys (%$artists))[0];
-	}
-	if ($album_artist) {
-	    out (suggest ($hinfo, $album_artist, 'ALBARTM', $actions->{ALBARTM}));
-	}
+    if ( (keys (%$album_artist) == 1 and $missing_album_artist_count > 0) or
+	 (keys (%$album_artist) > 1) ) {
+	 # there is just one album artist but not everywhere OR
+	 # there are more album artists
+
+	# use the most frequent album artists
+	my ($frequent_album_artist) =
+	    sort { $album_artist->{$a} <=> $album_artist->{$b}} keys %$album_artist;
+	out (suggest ($hinfo, $frequent_album_artist, 'ALBARTA', $actions->{ALBARTA}));
     }
 
     # report about tracks
@@ -468,6 +564,7 @@ sub errmsg {
 sub suggest {
     my ($hinfo, $suggestion, $code, $text) = @_;
     return if exists $ignore->{$code};
+    return if $options->repsuggest and not $suggestion;
     unless ($hinfo->{header_printed}) {
 	header ($hinfo->{dir});
 	$hinfo->{header_printed} = 1; # remember that header is already out
@@ -495,13 +592,16 @@ sub out {
 
 sub comment {
     out '# ' . shift() . "\n"
-	if $verbose;
+	if $options->verbose;
 }
 
 sub verbose {
-    my $msg = shift;
-    print STDOUT $msg
-	if $verbose;
+    msg (shift)
+	if $options->verbose;
+}
+
+sub msg {
+    print STDOUT shift();
 }
 
 1;

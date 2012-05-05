@@ -8,6 +8,7 @@ use warnings;
 use strict;
 
 use Audio::Scan;
+use Data::Dump qw(dump);
 
 my $info = 0;
 foreach my $filename (@ARGV) {
@@ -31,7 +32,11 @@ sub show {
     foreach my $key (keys %$data) {
 	print STDOUT "\t$key\n";
 	foreach my $name (sort keys %{ $data->{$key} }) {
-	    print STDOUT sprintf ("\t\t%-20s => %s\n", $name, $data->{$key}->{$name});
+	    my $value = $data->{$key}->{$name};
+	    if (ref ($value)) {
+		$value = dump ($value);
+	    }
+	    print STDOUT sprintf ("\t\t%-20s => %s\n", $name, $value);
 	}
     }
 }
